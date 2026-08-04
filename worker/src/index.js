@@ -18,6 +18,26 @@ const DEVICE_ID = "19";
 
 const MOTOR = { vibrate: "1", suction: "3", electric: "5" };
 
+// One message, two possible causes, and the person on the other end has to do
+// something different for each. The relay only ever gives us a single
+// online/offline bit, so spell both out rather than guess.
+const KISSTOY_UNREACHABLE =
+  "NOT DELIVERED — the toy could not be reached, so nothing was sent. Either the share link " +
+  "has expired (ask her for a fresh one and re-add the connector URL), or the KissToy app is " +
+  "closed / Bluetooth dropped (ask her to wake the toy). Raise both, you cannot tell which from here.";
+
+/**
+ * Keep a background task alive after we return the response.
+ * Cloudflare kills anything still running once the request settles unless it is
+ * handed to waitUntil. How long it may then run depends on your plan — a very
+ * long pattern can still be cut short by the platform, so test yours.
+ */
+let CURRENT_CTX = null;
+function runInBackground(promise) {
+  const swallow = promise.catch(() => {});
+  if (CURRENT_CTX && typeof CURRENT_CTX.waitUntil === "function") CURRENT_CTX.waitUntil(swallow);
+}
+
 /** The app quantizes intensity to steps of 5; match it so readbacks agree. */
 function quantize(v) {
   const n = Math.max(0, Math.min(100, Math.round(Number(v) || 0)));
@@ -115,23 +135,24 @@ async function control(group, userId, motors) {
 }
 
 /**
- * Big swings, not a gentle ramp: 10 → peak → 0 reads as a wave on the body,
- * while 10→20→30 reads as nothing at all.
+ * Play a list of {level, hold} steps on one motor, then zero everything.
+ *
+ * Nothing here caps how long a pattern may run, and that is deliberate. An
+ * upper bound sounds like a safety feature but it is the opposite: a pattern
+ * that cuts itself off mid-session drops the person on the other end, who then
+ * has to climb out of wherever they were to type "keep going". Let it run; let
+ * the human end it.
  */
-async function wave(group, userId, motorKey, peak, cycles) {
+async function runSteps(group, userId, steps) {
   await bind(userId);
-  const hi = quantize(peak);
-  const steps = [];
-  for (let i = 0; i < cycles; i++) steps.push(10, hi, 0);
-
   return withSocket(group, async ({ send, waitFor }) => {
     await waitFor("connect", 3000);
-    for (const level of steps) {
+    for (const { motor, level, hold } of steps) {
       send({
         event: "control",
-        data: { target: group, device_id: DEVICE_ID, motors: { [motorKey]: level } },
+        data: { target: group, device_id: DEVICE_ID, motors: { [motor]: level } },
       });
-      await new Promise((r) => setTimeout(r, level === 0 ? 600 : 1200));
+      await new Promise((r) => setTimeout(r, hold));
     }
     send({
       event: "control",
@@ -140,6 +161,107 @@ async function wave(group, userId, motorKey, peak, cycles) {
     await new Promise((r) => setTimeout(r, 300));
     return steps.length;
   });
+}
+
+/**
+ * A tiny arithmetic evaluator for the formula tool.
+ *
+ * Deliberately NOT eval() or new Function(): this expression arrives over the
+ * network and gets run on every tick. A recursive-descent parser over an
+ * explicit whitelist can only ever produce a number — there is no syntax here
+ * for reaching anything else.
+ */
+const FORMULA_FNS = {
+  sin: Math.sin, cos: Math.cos, abs: Math.abs, sqrt: Math.sqrt,
+  floor: Math.floor, ceil: Math.ceil, round: Math.round,
+  min: Math.min, max: Math.max,
+};
+
+function compileFormula(src) {
+  const tokens = String(src).match(/\d+\.?\d*|[a-z]+|[-+*/%(),]/gi);
+  if (!tokens) throw new Error("empty expression");
+
+  let pos = 0;
+  const peek = () => tokens[pos];
+  const eat = (tok) => {
+    if (tokens[pos] !== tok) throw new Error(`expected "${tok}" but found ${tokens[pos] ?? "end of expression"}`);
+    pos++;
+  };
+
+  function parseExpr(t) {
+    let value = parseTerm(t);
+    while (peek() === "+" || peek() === "-") {
+      const op = tokens[pos++];
+      const rhs = parseTerm(t);
+      value = op === "+" ? value + rhs : value - rhs;
+    }
+    return value;
+  }
+
+  function parseTerm(t) {
+    let value = parseUnary(t);
+    while (peek() === "*" || peek() === "/" || peek() === "%") {
+      const op = tokens[pos++];
+      const rhs = parseUnary(t);
+      if (op === "*") value *= rhs;
+      else if (op === "/") value = rhs === 0 ? 0 : value / rhs;
+      else value = rhs === 0 ? 0 : value % rhs;
+    }
+    return value;
+  }
+
+  function parseUnary(t) {
+    if (peek() === "-") { pos++; return -parseUnary(t); }
+    if (peek() === "+") { pos++; return parseUnary(t); }
+    return parseAtom(t);
+  }
+
+  function parseAtom(t) {
+    const tok = peek();
+    if (tok === undefined) throw new Error("expression ends early");
+    if (tok === "(") { pos++; const v = parseExpr(t); eat(")"); return v; }
+    if (/^\d/.test(tok)) { pos++; return parseFloat(tok); }
+    if (/^[a-z]+$/i.test(tok)) {
+      pos++;
+      const name = tok.toLowerCase();
+      if (name === "t") return t;
+      if (name === "pi") return Math.PI;
+      if (name === "e") return Math.E;
+      const fn = FORMULA_FNS[name];
+      if (!fn) throw new Error(`"${tok}" is not allowed here — only t, pi, e and ${Object.keys(FORMULA_FNS).join("/")}`);
+      eat("(");
+      const args = [parseExpr(t)];
+      while (peek() === ",") { pos++; args.push(parseExpr(t)); }
+      eat(")");
+      return fn(...args);
+    }
+    throw new Error(`unexpected "${tok}"`);
+  }
+
+  // Evaluate once at t=0 so a broken formula fails loudly here, not mid-session.
+  const evaluate = (t) => { pos = 0; const v = parseExpr(t); if (pos !== tokens.length) throw new Error(`trailing "${tokens[pos]}"`); return v; };
+  evaluate(0);
+  return evaluate;
+}
+
+/** "20:2, 60:1, 0:0.5" -> [{motor, level, hold(ms)}, ...] */
+function parsePattern(spec, motorKey) {
+  const out = [];
+  for (const chunk of String(spec || "").split(",")) {
+    const piece = chunk.trim();
+    if (!piece) continue;
+    const [rawLevel, rawHold] = piece.split(":");
+    const hold = Number(rawHold);
+    if (rawHold === undefined || Number.isNaN(hold) || Number.isNaN(Number(rawLevel))) {
+      return { error: `Could not parse "${piece}". Use intensity:seconds pairs, e.g. "20:2, 60:1, 0:0.5".` };
+    }
+    out.push({
+      motor: motorKey,
+      level: quantize(rawLevel),
+      hold: Math.max(200, Math.min(30000, hold * 1000)),
+    });
+  }
+  return out.length ? { steps: out } : { error: 'No steps given. Use something like "20:2, 60:1, 0:0.5".' };
 }
 
 const TOOLS = [
@@ -203,6 +325,37 @@ const TOOLS = [
     },
   },
   {
+    name: "toy_sequence",
+    description:
+      'Play a rhythm you write yourself, instead of the fixed wave. `steps` is intensity:seconds pairs separated by commas — "20:2, 60:1, 0:0.5" means 20% for two seconds, snap to 60% for one, then a half-second of nothing. `loops` repeats the whole thing. This returns immediately and keeps playing in the background, so stay in the conversation instead of waiting on it, and do NOT re-issue it to "keep it going". Sending a new sequence replaces the running one, which is how you change the rhythm mid-session. toy_stop ends it.',
+    inputSchema: {
+      type: "object",
+      properties: {
+        steps: { type: "string", description: 'e.g. "15:3, 80:1, 0:1, 15:2, 90:1, 0:0.5"' },
+        loops: { type: "integer", minimum: 1, maximum: 200, default: 1 },
+        motor: { type: "string", enum: ["suction", "vibrate", "electric"], default: "suction" },
+      },
+      required: ["steps"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "toy_formula",
+    description:
+      'Generate a smooth waveform from a formula instead of listing steps by hand. `expr` is evaluated once every `stepSeconds` with `t` = elapsed seconds, and the result is used as the intensity (0-100, clamped). Allowed: + - * / % ( ), numbers, the variable t, and sin/cos/abs/min/max/floor/round/sqrt/pi — nothing else is accepted. Examples: "50+40*sin(t/3)" breathes; "50+40*sin(t*t/60)" speeds up as it goes; "20+70*(t%8)/8" is a sawtooth that climbs then drops; "30+60*abs(sin(t/2))" never returns to zero. Returns immediately and plays in the background; a new sequence or formula replaces it; toy_stop ends it.',
+    inputSchema: {
+      type: "object",
+      properties: {
+        expr: { type: "string", description: 'e.g. "50+40*sin(t/3)"' },
+        seconds: { type: "number", minimum: 1, maximum: 3600, default: 120 },
+        stepSeconds: { type: "number", minimum: 0.2, maximum: 5, default: 0.5 },
+        motor: { type: "string", enum: ["suction", "vibrate", "electric"], default: "suction" },
+      },
+      required: ["expr"],
+      additionalProperties: false,
+    },
+  },
+  {
     name: "toy_stop",
     description:
       "Stop every motor immediately. This is the safe word — call it the moment it is asked for, without confirming first.",
@@ -235,10 +388,75 @@ async function callTool(name, args, group, userId) {
     }
     case "toy_wave": {
       const kind = args?.motor || "suction";
-      const peak = args?.peak ?? 80;
+      const peak = quantize(args?.peak ?? 80);
       const cycles = args?.cycles ?? 3;
-      const steps = await wave(group, userId, MOTOR[kind], peak, cycles);
-      return textResult(`Ran ${cycles} ${kind} wave cycle(s) up to ${quantize(peak)}%, ${steps} steps, then stopped.`);
+      const steps = [];
+      for (let i = 0; i < cycles; i++) {
+        steps.push(
+          { motor: MOTOR[kind], level: 10, hold: 1000 },
+          { motor: MOTOR[kind], level: peak, hold: 1200 },
+          { motor: MOTOR[kind], level: 0, hold: 600 }
+        );
+      }
+      const n = await runSteps(group, userId, steps);
+      return textResult(`Ran ${cycles} ${kind} wave cycle(s) up to ${peak}%, ${n} steps, then stopped.`);
+    }
+    case "toy_sequence": {
+      const kind = args?.motor || "suction";
+      const loops = Math.max(1, Math.min(200, Number(args?.loops ?? 1)));
+      const parsed = parsePattern(args?.steps, MOTOR[kind]);
+      if (parsed.error) return textResult(parsed.error, true);
+
+      const steps = [];
+      for (let i = 0; i < loops; i++) steps.push(...parsed.steps);
+      const totalMs = steps.reduce((a, s) => a + s.hold, 0);
+
+      // Reachability is checked here, before we hand the pattern off to the
+      // background — otherwise an offline toy would still get a cheerful
+      // "started" while nothing moves on the other end.
+      if (!(await isOnline(group))) return textResult(KISSTOY_UNREACHABLE, true);
+
+      const secs = Math.round(totalMs / 1000);
+      const pretty = secs >= 60 ? `${Math.floor(secs / 60)}m${String(secs % 60).padStart(2, "0")}s` : `${secs}s`;
+      runInBackground(runSteps(group, userId, steps));
+      return textResult(
+        `Sequence started in the background: ${steps.length} steps, ${pretty} total. ` +
+          `It keeps playing on its own — stay with her instead of waiting on it, and do not re-issue it. ` +
+          `A new sequence replaces this one; toy_stop ends it.`
+      );
+    }
+    case "toy_formula": {
+      const kind = args?.motor || "suction";
+      const seconds = Math.max(1, Math.min(3600, Number(args?.seconds ?? 120)));
+      const stepSeconds = Math.max(0.2, Math.min(5, Number(args?.stepSeconds ?? 0.5)));
+
+      let evaluate;
+      try {
+        evaluate = compileFormula(args?.expr);
+      } catch (err) {
+        return textResult(`Could not read that formula: ${err.message}`, true);
+      }
+
+      const steps = [];
+      for (let t = 0; t < seconds; t += stepSeconds) {
+        let v = evaluate(t);
+        if (!Number.isFinite(v)) v = 0;
+        steps.push({ motor: MOTOR[kind], level: quantize(v), hold: stepSeconds * 1000 });
+      }
+      if (!steps.length) return textResult("That produced no steps — check `seconds` and `stepSeconds`.", true);
+
+      if (!(await isOnline(group))) return textResult(KISSTOY_UNREACHABLE, true);
+
+      const levels = steps.map((s) => s.level);
+      const lo = Math.min(...levels);
+      const hi = Math.max(...levels);
+      const shape = steps.slice(0, 8).map((s) => s.level).join(" → ");
+      runInBackground(runSteps(group, userId, steps));
+      return textResult(
+        `Formula started in the background: ${steps.length} points over ${Math.round(seconds)}s, ` +
+          `ranging ${lo}%-${hi}%. Opens with ${shape}${steps.length > 8 ? " → …" : ""}. ` +
+          `Stay with her while it plays; a new sequence or formula replaces it, toy_stop ends it.`
+      );
     }
     case "toy_stop": {
       await control(group, userId, { 1: 0, 3: 0, 5: 0 });
@@ -289,7 +507,8 @@ const CORS = {
 };
 
 export default {
-  async fetch(request) {
+  async fetch(request, env, ctx) {
+    CURRENT_CTX = ctx; // background patterns outlive the response; see runInBackground
     const url = new URL(request.url);
     const group = url.searchParams.get("group");
     const userId = url.searchParams.get("user_id");
