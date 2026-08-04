@@ -1,0 +1,13 @@
+name = "kisstoy-remote-mcp"
+main = "src/index.js"
+compatibility_date = "2026-01-01"
+
+# Nothing is configured here on purpose.
+#
+# The session identifiers live in the connector URL, not in the Worker:
+#   https://<your-worker>.workers.dev/mcp?group=<GROUP>&user_id=<USER_ID>
+#
+# That keeps this deployment stateless — it stores nothing, logs nothing, and
+# has no idea whose toy it is talking to until a request arrives. It also means
+# the URL is the credential. Treat it like a password: anyone who has it can
+# drive the toy.
